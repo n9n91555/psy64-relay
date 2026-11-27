@@ -1,0 +1,16 @@
+# psy64-relay — 心理64 Cloudflare Worker 中繼
+# 定稿：consult-20261127-psych64/verdict.md §6、§9.1
+# 部署步驟見 README.md。KV namespace ID 部署時填入（見 README 步驟 2）。
+
+name = "psy64-relay"
+main = "src/index.js"
+compatibility_date = "2026-11-27"
+
+# 每小時整點觸發一次（台北時間每小時 00 分；cron 以 UTC 計，整點即整點）
+[triggers]
+crons = ["0 * * * *"]
+
+[[kv_namespaces]]
+binding = "PSY64_KV"
+# TODO：部署時填入 wrangler kv namespace create psy64-kv 回傳的 id
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
