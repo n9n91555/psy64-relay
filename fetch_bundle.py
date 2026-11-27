@@ -20,12 +20,15 @@ psy64-relay — 心理64 GitHub Actions 中繼（fetch_bundle.py）
 資料來源皆為公開端點、無任何 key（目前程式內沒有任何 API key；
 Glassnode／Coinglass／LunarCrush 等付費牆來源一律出 null，不硬撐）。
 
-運作（由 .github/workflows/hourly.yml 每小時第 17 分觸發）：
+運作（由 VM cron 每小時 :19 主動 workflow_dispatch 觸發；GitHub 內建
+ schedule 依定稿 consult-20261127-github-schedule §4.3 暫時停用，待 FWW
+ 上線＋7 天無覆寫事故後再加回當備援）：
  - 平行拉取 OKX / Deribit / CoinGecko / Alternative.me / FRED / GDELT /
    edgeornot（單一來源逾時 10 秒，失敗不拖垮整包）
  - 打包 192 筆（PSY01–PSY64 × BTC／ETH／XAU）→ bundle.json（repo 根目錄，
-   最新一包）＋ history/<台北小時>.json（append-only，保留近 45 天）
-   ＋ state.json（上一小時原始值，供變化率／last_valid_time 用）
+   最新一包）＋ history/<台北小時>.json（First-Write-Wins：同一小時首發
+   之後不再覆寫，保留近 45 天）＋ state.json（上一小時原始值，供變化率
+   ／last_valid_time 用，僅首發時更新）
  - 試算表 Psy64.gs 每小時 GET raw.githubusercontent.com 上的 bundle.json 一次
  - 缺值一律寫 null 並填 missing_reason，絕不以 0 代替（0 是中性觀測，不是缺失）
  - Binance 全線 451 地理封鎖：本程式不依賴 Binance；
@@ -54,6 +57,15 @@ except Exception:  # 系統無 tzdata 時退回固定 +08:00（台北無夏令�
 BASE = Path(__file__).resolve().parent
 TIMEOUT = 10            # 單一來源逾時（秒）
 HISTORY_KEEP_DAYS = 45  # 歷史包保留天數
+
+# 發布元數據（定稿 consult-20261127-github-schedule §6.3）：每包皆帶真實
+# 取值／發布時間與執行識別，同一小時兩次觀測才分得清。Actions 環境由
+# GitHub 注入 GITHUB_RUN_ID／GITHUB_EVENT_NAME；本機直跑則 fallback。
+RUN_ID = os.environ.get("GITHUB_RUN_ID") or (
+    "local-" + datetime.now(TAIPEI).strftime("%Y%m%dT%H%M%S"))
+EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME") or "manual"
+TRIGGER_SOURCE = {"schedule": "github-schedule",
+                  "workflow_dispatch": "workflow_dispatch"}.get(EVENT_NAME, EVENT_NAME)
 ASSETS = ["BTC", "ETH", "XAU"]
 USER_AGENT = "psy64-relay/1.0 (+psych64)"
 
@@ -873,7 +885,7 @@ def build_items_eh(D, S, ctx, items):
 
 
 # ---------- 完成 bundle：補 last_valid_time／stale_age_h／is_duplicate ----------
-def finalize(items, bundle_time_ms, prev_items):
+def finalize(items, bundle_time_ms, prev_items, fetch_ms=None):
     out = []
     for it in items:
         key = f"{it['psy']}_{it['asset']}"
@@ -891,7 +903,8 @@ def finalize(items, bundle_time_ms, prev_items):
         out.append({
             "psy": it["psy"], "asset": it["asset"], "x": it["x"],
             "source_time": taipei_iso_from_ms(it["source_time"]),
-            "fetch_time": taipei_iso_from_ms(bundle_time_ms),
+            "fetch_time": taipei_iso_from_ms(
+                fetch_ms if fetch_ms is not None else bundle_time_ms),
             "last_valid_time": taipei_iso_from_ms(last_valid),
             "window": it["window"], "stale_age_h": stale,
             "is_duplicate": bool(dup), "missing_reason": it["missing_reason"] or "",
@@ -1039,17 +1052,57 @@ def run_hourly():
 
     raw_items, ctx = build_items(D, state)
     raw_items = build_items_eh(D, state, ctx, raw_items)
-    items = finalize(raw_items, bundle_time_ms, state["prevItems"])
+    # 真實取值完成時間（全部來源抓完的當下），不是 bundle_time 整點。
+    fetch_ms = int(taipei_now().timestamp() * 1000)
+    items = finalize(raw_items, bundle_time_ms, state["prevItems"], fetch_ms)
 
-    bundle = {"bundle_time": bundle_time, "items": items, "meta": meta}
+    publish_ms = int(taipei_now().timestamp() * 1000)
+    bundle = {"bundle_time": bundle_time, "items": items, "meta": {
+        **meta,
+        "published_at": taipei_iso_from_ms(publish_ms),
+        "fetch_time": taipei_iso_from_ms(fetch_ms),
+        "run_id": RUN_ID, "event": EVENT_NAME,
+        "trigger_source": TRIGGER_SOURCE, "revision": 1,
+    }}
     bundle_text = json.dumps(bundle, ensure_ascii=False)
 
-    # 寫出：最新一包＋歷史 append-only＋state
-    (BASE / "bundle.json").write_text(bundle_text, encoding="utf-8")
+    # 寫出：First-Write-Wins（定稿 consult-20261127-github-schedule §6.3）。
+    # 同一 bundle_time 已發布過，晚到的 run 一律不覆寫 history／bundle／state。
     hist_dir = BASE / "history"
     hist_dir.mkdir(exist_ok=True)
-    (hist_dir / f"{hour}.json").write_text(bundle_text, encoding="utf-8")
-    prune_history(hist_dir)
+    hist_path = hist_dir / f"{hour}.json"
+    already_published = hist_path.exists()
+    wrote_history = False
+    if already_published:
+        print(f"[psy64] FWW skip: history {hour}.json already published, not overwriting")
+    else:
+        hist_path.write_text(bundle_text, encoding="utf-8")
+        wrote_history = True
+        prune_history(hist_dir)
+
+    # bundle.json 是「最新一包」指標，只接受不倒退的寫入。
+    # 首發：現有 bundle_time <= 新 bundle_time 才寫。
+    # 重複 run：只有現有 bundle_time 嚴格小於本小時（指標落後）才從已發布的
+    # history 檔補寫，絕不以本次重取的值覆寫首發版。
+    bundle_path = BASE / "bundle.json"
+    prev_bundle = load_json(bundle_path)
+    prev_bt = (prev_bundle or {}).get("bundle_time") or ""
+    if wrote_history:
+        if prev_bt <= bundle_time:
+            bundle_path.write_text(bundle_text, encoding="utf-8")
+        else:
+            print(f"[psy64] skip bundle.json: existing {prev_bt} newer than {bundle_time}")
+    elif prev_bt < bundle_time:
+        bundle_path.write_text(hist_path.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"[psy64] bundle.json catch-up from published history {hour}.json")
+    else:
+        print(f"[psy64] skip bundle.json: {bundle_time} already published")
+
+    if not wrote_history:
+        print("[psy64] skip state.json: duplicate run, state untouched")
+        n_null = sum(1 for i in items if i["x"] is None)
+        print(f"[psy64] bundle {bundle_time} items={len(items)} null={n_null} (duplicate, nothing written)")
+        return {"bundle_time": bundle_time, "items": len(items), "nulls": n_null}
 
     prev_items = {}
     for it in items:

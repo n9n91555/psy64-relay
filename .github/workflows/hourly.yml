@@ -9,15 +9,26 @@
 # - repo 必須是公開的，試算表才能免認證抓 raw URL。
 #   私人 repo 的 raw URL 須帶 token 才能讀，Psy64.gs 無法直接用。
 # - 排程用每小時第 17 分（避開整點尖峰；GitHub 排程在尖峰時可能延遲 15 分鐘以上）。
+# - 2026-11-28 定稿 consult-20261127-github-schedule §4.3：GitHub schedule
+#   12 個時段僅觸發 1 次（且晚 35 分鐘），已暫時停用；主觸發改為 VM cron
+#   每小時 :19 workflow_dispatch。FWW 上線＋7 天無覆寫事故後再把 schedule
+#   加回來當備援。
 # - GitHub 會自動停用 60 天完全無活動的 repo 的排程；本 repo 每小時
 #   都有 commit，屬持續活動，若仍被停用，進 Actions 頁按 Enable 即可恢復。
 
 name: psy64 hourly relay
 
 on:
-  schedule:
-    - cron: "17 * * * *"  # 每小時第 17 分（UTC 分鐘＝台北分鐘，時區無關）
-  workflow_dispatch:       # 手動觸發（Actions 頁 → Run workflow）
+  # schedule 暫時停用（定稿 §4.3，2026-11-28；FWW 上線＋7 天無事故後再加回）：
+  # schedule:
+  #   - cron: "17 * * * *"  # 每小時第 17 分（UTC 分鐘＝台北分鐘，時區無關）
+  workflow_dispatch:       # 手動觸發（Actions 頁 → Run workflow）；VM cron 每小時 :19 主觸發
+
+# 寫入防呆（定稿 §6.3）：同一時間只允許一個寫入 job 在跑，排隊者等前一個
+# 跑完再跑（不取消進行中的寫入）；資料層另有 First-Write-Wins 擋覆寫。
+concurrency:
+  group: psy64-hourly
+  cancel-in-progress: false
 
 permissions:
   contents: write          # 須寫回 bundle.json／history／state.json
